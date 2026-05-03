@@ -1,6 +1,7 @@
 """
 main.py — FastAPI application entry point for the HPE Threat Detection Pipeline.
 Handles startup/shutdown lifecycle, CORS, and route registration.
+Phase 2: vault_infra_client connected on startup using the vault hvac client.
 """
 
 import logging
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import APP_NAME, APP_TAGLINE, APP_VERSION, MODEL_PATH
-from app import inference, kafka_client, elastic_client, vault_client
+from app import inference, kafka_client, elastic_client, vault_client, vault_infra_client
 from app.routes import predict, health, pipeline, simulate, admin
 import asyncio
 from app.ws_manager import manager as ws_manager, admin_manager
@@ -62,7 +63,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[WARN] Elasticsearch unavailable: {e}")
 
-    # Connect to Vault
+    # Connect to Vault (user-level KV rotation)
     try:
         vault_connected = vault_client.connect_vault()
         if vault_connected:
@@ -72,10 +73,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[WARN] Vault unavailable: {e}")
 
+    # Connect vault_infra_client (Phase 2 — database secrets engine)
+    # Reuses the hvac client already authenticated by vault_client
+    try:
+        if vault_client.is_connected() and vault_client._client is not None:
+            infra_connected = vault_infra_client.connect(vault_client._client)
+            if infra_connected:
+                logger.info("[OK] Vault infrastructure client connected (database secrets engine)")
+            else:
+                logger.warning("[WARN] Vault infra client failed — infrastructure rotation unavailable")
+        else:
+            logger.warning("[WARN] Vault not connected — skipping infra client setup")
+    except Exception as e:
+        logger.warning(f"[WARN] Vault infra client unavailable: {e}")
+
     # Start Kafka consumer if connected
     result_queue = asyncio.Queue()
     broadcast_task = None
-    
+
     if kafka_client.is_connected():
         loop = asyncio.get_running_loop()
         kafka_client.start_consumer(
@@ -84,13 +99,13 @@ async def lifespan(app: FastAPI):
             result_queue=result_queue,
         )
         logger.info("[OK] Kafka consumer started")
-        
+
         async def broadcast_results():
             while True:
                 try:
                     result = await result_queue.get()
                     result_data = result.model_dump()
-                    
+
                     # Broadcast to simulation dashboard
                     await ws_manager.broadcast({
                         "type": "pipeline_result",
@@ -99,7 +114,7 @@ async def lifespan(app: FastAPI):
                             "prediction": result_data,
                         }
                     })
-                    
+
                     # If this event created an admin alert, notify admin clients
                     alert_id = result.event_summary.get("alert_id")
                     if alert_id:
@@ -111,7 +126,7 @@ async def lifespan(app: FastAPI):
                             })
                 except Exception as e:
                     logger.error(f"Broadcast error: {e}")
-        
+
         broadcast_task = asyncio.create_task(broadcast_results())
 
     logger.info(f"\n  Pipeline ready. Serving on http://0.0.0.0:8000")

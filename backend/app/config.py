@@ -10,6 +10,9 @@ ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 VAULT_ADDR = os.getenv("VAULT_ADDR", "http://localhost:8200")
 VAULT_TOKEN = os.getenv("VAULT_TOKEN", "hpe-dev-token")
 
+# ── PostgreSQL (Phase 2 — Vault database secrets engine) ──────────────────────
+POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://localhost:5432/hpedb")
+
 # ── Model paths ────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(BASE_DIR, "model_output", "pipeline_artifacts_v2.joblib"))
@@ -29,14 +32,16 @@ KAFKA_AUDIT_TOPIC = "hpe-audit"
 ES_AUDIT_INDEX = "hpe-audit-logs"
 ES_THREATS_INDEX = "hpe-threats"
 
-# ── Vault secrets path ─────────────────────────────────────────────────────────
+# ── Vault paths ────────────────────────────────────────────────────────────────
 VAULT_SECRETS_PATH = "secret/data/hpe/credentials"
+VAULT_DB_BACKEND_ROLE = "hpe-backend-role"    # read/write, TTL=1h
+VAULT_DB_READONLY_ROLE = "hpe-readonly-role"  # read only,  TTL=30m
 
 # ── Threat thresholds ──────────────────────────────────────────────────────────
 THREAT_LEVELS = {
-    "ALLOW": 0.3,       # Below this → allow
-    "MONITOR": 0.6,     # Between ALLOW and MONITOR → monitor
-    "BLOCK": 0.85,      # Between MONITOR and BLOCK → block
+    "ALLOW":   0.3,   # Below this → allow
+    "MONITOR": 0.6,   # Between ALLOW and MONITOR → monitor
+    "BLOCK":   0.85,  # Between MONITOR and BLOCK → block
     # Above BLOCK → CRITICAL_ALERT
 }
 
