@@ -66,25 +66,53 @@ services:
     networks:
       - hpe-network
 
-  # ── HashiCorp Vault (dev mode) ──
+  # ── HashiCorp Vault (server mode — persistent Raft storage) ──
+  # Pinned to 1.15.6 — latest tag has a broken entrypoint on Windows Docker Desktop
+  # entrypoint: vault overrides the image's docker-entrypoint.sh which tries to
+  # chown config files and set CAP_SETFCAP — both fail on Windows. Jumping straight
+  # to the vault binary skips all of that.
   vault:
-    image: hashicorp/vault:latest
+    image: hashicorp/vault:1.15.6
     container_name: hpe-vault
     ports:
       - "8200:8200"
+      - "8201:8201"
     environment:
-      - VAULT_DEV_ROOT_TOKEN_ID=hpe-dev-token
-      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
-      - VAULT_ADDR=http://127.0.0.1:8200
-      - SKIP_SETCAP=1
-    command: server -dev
+      - VAULT_ADDR=http://0.0.0.0:8200
+      - VAULT_API_ADDR=http://vault:8200
+      - VAULT_CLUSTER_ADDR=http://vault:8201
+      - SKIP_CHOWN=true
+      - SKIP_SETCAP=true
+    entrypoint: vault
+    command: server -config=/vault/config/vault.hcl
+    volumes:
+      - ./vault/config:/vault/config
+      - vault_data:/vault/data
     healthcheck:
-      test: [ "CMD", "vault", "status" ]
+      test: [ "CMD-SHELL", "vault status -address=http://127.0.0.1:8200 2>&1 | grep -E 'Initialized|Sealed'" ]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 10
     networks:
       - hpe-network
+
+  # ── Vault Init (runs once after vault is healthy, then exits) ──
+  vault-init:
+    image: hashicorp/vault:1.15.6
+    container_name: hpe-vault-init
+    environment:
+      - VAULT_ADDR=http://vault:8200
+    entrypoint: sh
+    command: /vault/init/init-vault.sh
+    volumes:
+      - ./vault/init:/vault/init
+      - vault_data:/vault/data
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks:
+      - hpe-network
+    restart: "no"
 
   # ── FastAPI Backend ──
   backend:
@@ -111,6 +139,8 @@ services:
         condition: service_healthy
       vault:
         condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
     networks:
       - hpe-network
 
@@ -131,6 +161,7 @@ volumes:
   kafka_data:
   es_data:
   kibana_data:
+  vault_data:
 
 
 networks:
