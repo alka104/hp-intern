@@ -1,8 +1,7 @@
 """
 routes/admin.py — Security Admin Dashboard API endpoints.
-Phase 4: CRITICAL_ALERT approval triggers BOTH user-level AND
-         infrastructure credential rotation.
-         BLOCK approval triggers user-level rotation only.
+Phase 4: CRITICAL_ALERT approval fires user + infrastructure rotation.
+Phase 5: Kafka credential rotation via Vault KV + reconnect on CRITICAL_ALERT.
 """
 
 import logging
@@ -17,14 +16,13 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 def _determine_affected_service(event_data: dict) -> str:
     """
-    Map the anomaly type to the infrastructure service most at risk.
-    Called only for CRITICAL_ALERT approvals.
+    Map anomaly type to the infrastructure service most at risk.
 
-    Logic:
-    - data_exfiltration / bulk_download  → elasticsearch  (attacker querying audit logs)
-    - lateral_movement / priv_escalation → kafka          (attacker injecting fake events)
-    - admin action                        → database       (rotate the DB service account)
-    - default                             → elasticsearch  (protect the audit trail)
+    Phase 5 routing:
+      data_exfiltration / bulk_download  → elasticsearch (dynamic DB creds)
+      lateral_movement / priv_escalation → kafka         (Vault KV + reconnect)
+      admin action                        → database      (dynamic DB creds)
+      default                             → elasticsearch
     """
     anomaly = event_data.get("anomaly_type", "None")
     action = event_data.get("action", "")
@@ -41,10 +39,6 @@ def _determine_affected_service(event_data: dict) -> str:
 
 @router.get("/alerts")
 async def get_alerts(status: str = None, severity: str = None, limit: int = 100):
-    """
-    List all admin alerts.
-    Query params: ?status=pending|approved|rejected&severity=critical|high|medium&limit=100
-    """
     alerts = admin_store.get_all_alerts(status=status, severity=severity, limit=limit)
     pending_count = sum(1 for a in admin_store.get_all_alerts(status="pending"))
     return {
@@ -56,7 +50,6 @@ async def get_alerts(status: str = None, severity: str = None, limit: int = 100)
 
 @router.get("/alerts/{alert_id}")
 async def get_alert_detail(alert_id: str):
-    """Get full forensic details for a single alert."""
     alert = admin_store.get_alert(alert_id)
     if not alert:
         return {"error": f"Alert {alert_id} not found"}
@@ -68,17 +61,11 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
     """
     Approve credential rotation for a threat alert.
 
-    Rotation strategy based on threat level:
-      BLOCK threat       → user-level rotation only
-                           vault_client.rotate_credentials(user=...)
+    BLOCK       → user-level rotation only (vault_client)
+    CRITICAL    → user-level + infrastructure rotation (vault_client + vault_infra_client)
 
-      CRITICAL_ALERT     → user-level rotation PLUS infrastructure rotation
-                           vault_client.rotate_credentials(user=...)
-                           vault_infra_client.rotate_infrastructure_credentials(service=...)
-
-    This is proportionate response — CRITICAL threats get both layers rotated
-    because at score > 0.85, the attacker may have already pivoted from the
-    user account to the service infrastructure.
+    Phase 5: if affected_service == 'kafka', vault_infra_client rotates
+    the Kafka KV secret and triggers kafka_client.reconnect_kafka().
     """
     alert = admin_store.approve_alert(alert_id, admin_notes=request.admin_notes)
     if not alert:
@@ -97,7 +84,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
             message=f"Alert already resolved as: {alert['status']}",
         )
 
-    # ── User-level rotation (fires for ALL approvals: BLOCK + CRITICAL) ───────
+    # ── User-level rotation (all approvals) ───────────────────────────────────
     user_rotation_result = vault_client.rotate_credentials(
         reason=f"admin_approved_{alert['threat_action'].lower()}_score_{alert['threat_score']:.4f}",
         user=alert["user_id"],
@@ -110,7 +97,7 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
         f"action={alert['threat_action']})"
     )
 
-    # ── Infrastructure rotation (fires ONLY for CRITICAL_ALERT) ──────────────
+    # ── Infrastructure rotation (CRITICAL_ALERT only) ─────────────────────────
     infra_rotation_result = None
     affected_service = None
 
@@ -122,12 +109,28 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
                 reason=f"admin_approved_critical_score_{alert['threat_score']:.4f}",
                 threat_score=alert["threat_score"],
             )
-            logger.warning(
-                f"[ADMIN] Infrastructure credential rotation for service='{affected_service}' "
-                f"(alert={alert_id}, "
-                f"new_user='{infra_rotation_result.get('new_credential', {}).get('username', 'n/a')}', "
-                f"success={infra_rotation_result.get('success')})"
-            )
+
+            # Phase 5 specific logging for Kafka rotation
+            if affected_service == "kafka":
+                kafka_reconnected = infra_rotation_result.get(
+                    "new_credential", {}
+                ).get("kafka_reconnected", False)
+                logger.warning(
+                    f"[ADMIN] Kafka credential rotation completed — "
+                    f"alert={alert_id} "
+                    f"vault_success={infra_rotation_result.get('success')} "
+                    f"kafka_reconnected={kafka_reconnected}"
+                )
+            else:
+                new_user = infra_rotation_result.get(
+                    "new_credential", {}
+                ).get("username", "n/a")
+                logger.warning(
+                    f"[ADMIN] Infrastructure credential rotation for "
+                    f"service='{affected_service}' "
+                    f"(alert={alert_id}, new_user='{new_user}', "
+                    f"success={infra_rotation_result.get('success')})"
+                )
         else:
             logger.warning(
                 f"[ADMIN] Vault infra client not connected — "
@@ -138,18 +141,17 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
                 "error": "vault_infra_client not connected",
             }
     else:
-        # BLOCK threat — infra rotation not triggered (proportionate response)
         logger.info(
-            f"[ADMIN] BLOCK threat approved — user rotation only, "
-            f"no infrastructure rotation (score={alert['threat_score']:.4f} < 0.85 threshold)"
+            f"[ADMIN] BLOCK threat approved — user rotation only "
+            f"(score={alert['threat_score']:.4f} < 0.85 CRITICAL threshold)"
         )
 
     # ── Attach combined result to alert for audit trail ───────────────────────
     combined_result = {
-        "user_rotation": user_rotation_result,
-        "infra_rotation": infra_rotation_result,
+        "user_rotation":    user_rotation_result,
+        "infra_rotation":   infra_rotation_result,
         "affected_service": affected_service,
-        "threat_action": alert["threat_action"],
+        "threat_action":    alert["threat_action"],
     }
     admin_store.set_rotation_result(alert_id, combined_result)
 
@@ -157,28 +159,37 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
     await admin_manager.broadcast({
         "type": "alert_resolved",
         "data": {
-            "alert_id": alert_id,
-            "action": "approved",
-            "user_id": alert["user_id"],
-            "threat_action": alert["threat_action"],
+            "alert_id":              alert_id,
+            "action":                "approved",
+            "user_id":               alert["user_id"],
+            "threat_action":         alert["threat_action"],
             "user_rotation_success": user_rotation_result.get("success", False),
-            "infra_rotation": infra_rotation_result,
-            "affected_service": affected_service,
+            "infra_rotation":        infra_rotation_result,
+            "affected_service":      affected_service,
         },
     })
 
     # ── Build response message ────────────────────────────────────────────────
     message_parts = [f"User credentials rotated for {alert['user_id']}."]
     if infra_rotation_result and infra_rotation_result.get("success"):
-        new_user = infra_rotation_result.get("new_credential", {}).get("username", "")
-        message_parts.append(
-            f"Infrastructure credentials rotated for '{affected_service}' "
-            f"(new DB user: {new_user[:20]}...)."
-        )
+        if affected_service == "kafka":
+            kafka_reconnected = infra_rotation_result.get(
+                "new_credential", {}
+            ).get("kafka_reconnected", False)
+            message_parts.append(
+                f"Kafka credentials rotated in Vault and "
+                f"{'reconnected' if kafka_reconnected else 'reconnect attempted'}."
+            )
+        else:
+            new_user = infra_rotation_result.get("new_credential", {}).get("username", "")
+            message_parts.append(
+                f"Infrastructure credentials rotated for '{affected_service}' "
+                f"(new DB user: {new_user[:24]}...)."
+            )
     elif alert["threat_action"] == "CRITICAL_ALERT" and infra_rotation_result:
         message_parts.append(
             f"Infrastructure rotation attempted for '{affected_service}' "
-            f"but failed: {infra_rotation_result.get('error', 'unknown error')}."
+            f"but failed: {infra_rotation_result.get('error', 'unknown')}."
         )
 
     return ApprovalResponse(
@@ -192,7 +203,6 @@ async def approve_alert(alert_id: str, request: ApprovalRequest):
 
 @router.post("/alerts/{alert_id}/reject", response_model=ApprovalResponse)
 async def reject_alert(alert_id: str, request: ApprovalRequest):
-    """Reject an alert as a false positive. No credential rotation of any kind."""
     alert = admin_store.reject_alert(alert_id, admin_notes=request.admin_notes)
     if not alert:
         return ApprovalResponse(
@@ -206,8 +216,8 @@ async def reject_alert(alert_id: str, request: ApprovalRequest):
         "type": "alert_resolved",
         "data": {
             "alert_id": alert_id,
-            "action": "rejected",
-            "user_id": alert["user_id"],
+            "action":   "rejected",
+            "user_id":  alert["user_id"],
         },
     })
 
@@ -215,13 +225,12 @@ async def reject_alert(alert_id: str, request: ApprovalRequest):
         success=True,
         alert_id=alert_id,
         action="rejected",
-        message=f"Alert {alert_id} rejected as false positive. No credentials rotated.",
+        message=f"Alert {alert_id} rejected as false positive.",
     )
 
 
 @router.get("/stats")
 async def get_admin_stats():
-    """Get admin dashboard summary statistics including infra rotation count."""
     stats = admin_store.get_stats()
     stats["infra_rotation_count"] = vault_infra_client.get_infra_rotation_count()
     stats["active_infra_leases"] = vault_infra_client.get_active_leases()
@@ -230,7 +239,6 @@ async def get_admin_stats():
 
 @router.get("/audit-log")
 async def get_audit_log(limit: int = 50):
-    """Get the history of all admin actions."""
     log = admin_store.get_audit_log(limit=limit)
     return {"total": len(log), "entries": log}
 
@@ -238,25 +246,21 @@ async def get_audit_log(limit: int = 50):
 @router.get("/infra-leases")
 async def get_infra_leases():
     """
-    Get all currently active Vault infrastructure leases.
-    Shows which PostgreSQL service users are live, their TTL, and expiry time.
-    Useful for verifying infrastructure rotation worked correctly.
+    Get all active infrastructure leases including Kafka Vault KV status.
+    Phase 5: Kafka section shows vault_managed_credential metadata.
     """
     return {
-        "active_leases": vault_infra_client.get_active_leases(),
+        "active_leases":         vault_infra_client.get_active_leases(),
         "total_infra_rotations": vault_infra_client.get_infra_rotation_count(),
         "vault_infra_connected": vault_infra_client.is_connected(),
     }
 
 
-# ── Admin WebSocket for real-time alert notifications ─────────────────────────
 @router.websocket("/ws")
 async def admin_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time admin alert push notifications."""
     await websocket.accept()
     admin_manager.add(websocket)
 
-    # Send current state on connect so admin dashboard initialises correctly
     stats = admin_store.get_stats()
     stats["infra_rotation_count"] = vault_infra_client.get_infra_rotation_count()
     await websocket.send_json({

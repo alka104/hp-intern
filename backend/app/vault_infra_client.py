@@ -1,21 +1,21 @@
 """
 vault_infra_client.py — Infrastructure credential rotation using
-Vault's Database Secrets Engine (Phase 2).
+Vault's Database Secrets Engine (Phase 2) and KV secrets (Phase 5).
 
-Unlike vault_client.py which manages static KV credentials per user,
-this module uses Vault's database engine to generate DYNAMIC credentials:
-  - Vault talks directly to PostgreSQL
-  - Creates a brand-new DB service user on every request
-  - That user auto-expires after TTL (1h for backend, 30m for readonly)
-  - On admin approval of CRITICAL threat: current lease revoked immediately,
-    new one issued — the old DB user is deleted from PostgreSQL instantly
+Phase 2: Dynamic PostgreSQL credentials via Vault database engine.
+Phase 5: Kafka credentials stored in Vault KV, rotated on CRITICAL_ALERT,
+         kafka_client.reconnect_kafka() called immediately after rotation.
 
-No static password ever sits in Vault KV store for infra credentials.
-Called from routes/admin.py when admin approves a CRITICAL_ALERT.
+Services and their rotation mechanism:
+  elasticsearch → Vault database engine (dynamic DB user, TTL=1h)
+  database      → Vault database engine (dynamic DB user, TTL=1h)
+  kafka         → Vault KV secret rotation + kafka_client reconnect
+  readonly      → Vault database engine (dynamic DB user, TTL=30m)
 """
 
 import logging
 import uuid
+import secrets as secrets_mod
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
@@ -28,9 +28,7 @@ logger = logging.getLogger("hpe.vault_infra")
 _client: Optional[hvac.Client] = None
 _connected = False
 
-# ── In-memory lease tracker ───────────────────────────────────────────────────
-# Tracks the currently active Vault lease per service.
-# { "service_name": { lease_id, username, issued_at, expires_at } }
+# In-memory lease tracker for database engine credentials
 _active_leases: Dict[str, Dict[str, Any]] = {}
 
 _infra_rotation_count = 0
@@ -65,15 +63,8 @@ def is_connected() -> bool:
 def get_dynamic_credential(service: str) -> Dict[str, Any]:
     """
     Ask Vault to generate a brand-new PostgreSQL credential on the fly.
-
-    Vault connects to PostgreSQL as vault-root, runs CREATE ROLE SQL,
-    and returns a temporary username + password that expires after TTL.
-    The credential is never stored anywhere — it exists only in the DB
-    and in memory here until the lease expires or is revoked.
-
-    service: 'backend' (read/write, TTL=1h) or 'readonly' (TTL=30m)
-             Also accepts 'elasticsearch', 'kafka', 'database' — all
-             map to hpe-backend-role for now.
+    Used for: elasticsearch, database, readonly services.
+    Vault connects to PostgreSQL, runs CREATE ROLE, returns temp creds.
     """
     if not _client or not _connected:
         return {"success": False, "error": "Vault infra client not connected"}
@@ -82,19 +73,17 @@ def get_dynamic_credential(service: str) -> Dict[str, Any]:
         "backend":       "hpe-backend-role",
         "database":      "hpe-backend-role",
         "elasticsearch": "hpe-backend-role",
-        "kafka":         "hpe-backend-role",
         "readonly":      "hpe-readonly-role",
     }
     role = role_map.get(service, "hpe-backend-role")
 
     try:
-        # Vault talks to PostgreSQL, creates a temp user, returns creds
         response = _client.secrets.database.generate_credentials(name=role)
 
         username = response["data"]["username"]
         password = response["data"]["password"]
         lease_id = response["lease_id"]
-        lease_duration = response["lease_duration"]  # seconds
+        lease_duration = response["lease_duration"]
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_duration)
 
         logger.info(
@@ -111,11 +100,85 @@ def get_dynamic_credential(service: str) -> Dict[str, Any]:
             "lease_duration": lease_duration,
             "expires_at": expires_at.isoformat(),
             "issued_at": datetime.now(timezone.utc).isoformat(),
+            "mechanism": "vault_database_engine",
         }
 
     except Exception as e:
         logger.error(f"[INFRA] Failed to generate dynamic credential for '{service}': {e}")
         return {"success": False, "error": str(e), "service": service}
+
+
+def _rotate_kafka_credential() -> Dict[str, Any]:
+    """
+    Phase 5: Rotate Kafka credentials in Vault KV.
+    Generates a new password, updates secret/hpe/kafka/credentials,
+    then calls kafka_client.reconnect_kafka() to rebuild clients.
+    """
+    try:
+        # Read current credential
+        current_data = {}
+        try:
+            response = _client.secrets.kv.v2.read_secret_version(
+                path="hpe/kafka/credentials",
+                raise_on_deleted_version=False,
+            )
+            current_data = response.get("data", {}).get("data", {})
+        except Exception:
+            pass
+
+        old_username = current_data.get("username", "hpe-kafka-producer")
+        rotation_count = current_data.get("rotation_count", 0) + 1
+
+        # Generate new password — username stays the same (service account)
+        new_password = f"hpe-kafka-rotated-{secrets_mod.token_hex(20)}"
+
+        new_creds = {
+            "username": old_username,
+            "password": new_password,
+            "broker": current_data.get("broker", "kafka:9092"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "rotation_count": rotation_count,
+            "description": (
+                "Kafka service account — rotated by vault_infra_client "
+                "on CRITICAL_ALERT admin approval."
+            ),
+        }
+
+        _client.secrets.kv.v2.create_or_update_secret(
+            path="hpe/kafka/credentials",
+            secret=new_creds,
+        )
+
+        logger.warning(
+            f"[INFRA] Kafka credentials rotated in Vault "
+            f"(user='{old_username}', rotation_count={rotation_count})"
+        )
+
+        # Immediately reconnect Kafka clients with new credentials
+        try:
+            from app import kafka_client
+            reconnect_success = kafka_client.reconnect_kafka()
+            logger.warning(
+                f"[INFRA] Kafka reconnect after rotation: "
+                f"{'success' if reconnect_success else 'FAILED'}"
+            )
+        except Exception as reconnect_err:
+            logger.error(f"[INFRA] Kafka reconnect error: {reconnect_err}")
+            reconnect_success = False
+
+        return {
+            "success": True,
+            "mechanism": "vault_kv_rotation",
+            "username": old_username,
+            "rotation_count": rotation_count,
+            "kafka_reconnected": reconnect_success,
+            "vault_path": "secret/hpe/kafka/credentials",
+            "rotated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"[INFRA] Kafka credential rotation failed: {e}")
+        return {"success": False, "error": str(e), "mechanism": "vault_kv_rotation"}
 
 
 def rotate_infrastructure_credentials(
@@ -126,16 +189,9 @@ def rotate_infrastructure_credentials(
     """
     Called by routes/admin.py when admin approves a CRITICAL_ALERT.
 
-    Steps:
-    1. Immediately revoke the current active lease for this service
-       (Vault tells PostgreSQL to DROP ROLE — user deleted instantly)
-    2. Issue a brand-new dynamic credential from Vault
-    3. Update the in-memory lease tracker
-
-    This is infrastructure-level rotation, complementing the user-level
-    rotation in vault_client.py. Both fire on CRITICAL_ALERT approval:
-      - vault_client.rotate_credentials(user=...)  → user KV secret updated
-      - rotate_infrastructure_credentials(service=...) → DB service user replaced
+    Routing:
+      kafka        → _rotate_kafka_credential() — KV rotation + reconnect
+      elasticsearch, database, readonly → get_dynamic_credential() — DB engine
     """
     global _infra_rotation_count
 
@@ -150,14 +206,40 @@ def rotate_infrastructure_credentials(
         f"service='{service}' reason='{reason}' score={threat_score:.4f}"
     )
 
-    # ── Step 1: Revoke current lease ──────────────────────────────────────────
+    # ── Kafka: KV rotation + reconnect (Phase 5) ──────────────────────────────
+    if service == "kafka":
+        result = _rotate_kafka_credential()
+        _infra_rotation_count += 1
+        latency_ms = (datetime.now(timezone.utc) - rotation_start).total_seconds() * 1000
+
+        return {
+            "success": result.get("success", False),
+            "rotation_id": rotation_id,
+            "rotation_number": _infra_rotation_count,
+            "service": service,
+            "reason": reason,
+            "threat_score": threat_score,
+            "timestamp": rotation_start.isoformat(),
+            "latency_ms": round(latency_ms, 2),
+            "new_credential": {
+                "username": result.get("username", ""),
+                "mechanism": result.get("mechanism", "vault_kv_rotation"),
+                "rotation_count": result.get("rotation_count", 0),
+                "kafka_reconnected": result.get("kafka_reconnected", False),
+            },
+            "revocation": {
+                "revoked": True,
+                "note": "Previous Kafka password invalidated in Vault KV",
+            },
+        }
+
+    # ── Database engine services: dynamic credentials ─────────────────────────
     revocation_result = {"revoked": False, "previous_lease": None}
     if service in _active_leases:
         current = _active_leases[service]
         old_lease_id = current.get("lease_id")
         old_username = current.get("username")
         try:
-            # Vault immediately tells PostgreSQL: DROP ROLE "old_username"
             _client.sys.revoke_lease(lease_id=old_lease_id)
             revocation_result = {
                 "revoked": True,
@@ -170,10 +252,9 @@ def rotate_infrastructure_credentials(
                 f"(DB user '{old_username}' deleted from PostgreSQL)"
             )
         except Exception as e:
-            logger.warning(f"[INFRA] Lease revocation warning (may have already expired): {e}")
+            logger.warning(f"[INFRA] Lease revocation warning: {e}")
             revocation_result = {"revoked": False, "error": str(e)}
 
-    # ── Step 2: Issue new dynamic credential ─────────────────────────────────
     new_creds = get_dynamic_credential(service)
 
     if not new_creds.get("success"):
@@ -185,7 +266,6 @@ def rotate_infrastructure_credentials(
             "revocation": revocation_result,
         }
 
-    # ── Step 3: Update lease tracker ─────────────────────────────────────────
     _active_leases[service] = {
         "lease_id":        new_creds["lease_id"],
         "username":        new_creds["username"],
@@ -215,10 +295,10 @@ def rotate_infrastructure_credentials(
         "latency_ms": round(latency_ms, 2),
         "new_credential": {
             "username":               new_creds["username"],
-            # password intentionally omitted from rotation result
             "lease_id":               new_creds["lease_id"],
             "lease_duration_seconds": new_creds["lease_duration"],
             "expires_at":             new_creds["expires_at"],
+            "mechanism":              new_creds["mechanism"],
         },
         "revocation": revocation_result,
     }
@@ -227,11 +307,12 @@ def rotate_infrastructure_credentials(
 def get_active_leases() -> Dict[str, Any]:
     """
     Returns metadata about all currently active infrastructure leases.
-    Used by /api/health and admin dashboard.
-    Passwords are never included — only lease IDs, usernames, TTL.
+    Includes both database engine leases and Kafka KV credential status.
     """
     result = {}
     now = datetime.now(timezone.utc)
+
+    # Database engine leases
     for service, lease in _active_leases.items():
         expires_str = lease.get("expires_at", "")
         try:
@@ -241,14 +322,28 @@ def get_active_leases() -> Dict[str, Any]:
             seconds_remaining = -1
 
         result[service] = {
-            "username":         lease.get("username"),
-            "lease_id":         lease.get("lease_id"),
-            "issued_at":        lease.get("issued_at"),
-            "expires_at":       expires_str,
+            "username":          lease.get("username"),
+            "lease_id":          lease.get("lease_id"),
+            "issued_at":         lease.get("issued_at"),
+            "expires_at":        expires_str,
             "seconds_remaining": max(seconds_remaining, 0),
-            "expired":          seconds_remaining <= 0,
-            "rotation_reason":  lease.get("rotation_reason", "initial"),
+            "expired":           seconds_remaining <= 0,
+            "rotation_reason":   lease.get("rotation_reason", "initial"),
+            "mechanism":         "vault_database_engine",
         }
+
+    # Phase 5: Kafka KV credential status
+    try:
+        from app import kafka_client
+        kafka_info = kafka_client.get_active_credential_info()
+        result["kafka"] = {
+            **kafka_info,
+            "mechanism": "vault_kv",
+            "rotation_reason": _active_leases.get("kafka", {}).get("rotation_reason", "initial"),
+        }
+    except Exception:
+        pass
+
     return result
 
 
