@@ -66,27 +66,76 @@ services:
     networks:
       - hpe-network
 
-  # ── HashiCorp Vault (dev mode) ──
-  vault:
-    image: hashicorp/vault:latest
-    container_name: hpe-vault
+  # ── PostgreSQL (Phase 2 — real DB for Vault dynamic secrets engine) ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: hpe-postgres
     ports:
-      - "8200:8200"
+      - "5432:5432"
     environment:
-      - VAULT_DEV_ROOT_TOKEN_ID=hpe-dev-token
-      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
-      - VAULT_ADDR=http://127.0.0.1:8200
-      - SKIP_SETCAP=1
-    command: server -dev
+      - POSTGRES_USER=vault-root
+      - POSTGRES_PASSWORD=vault-root-secret
+      - POSTGRES_DB=hpedb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: [ "CMD", "vault", "status" ]
+      test: [ "CMD-SHELL", "pg_isready -U vault-root -d hpedb" ]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 10
     networks:
       - hpe-network
 
+  # ── HashiCorp Vault (server mode — persistent Raft storage) ──
+  vault:
+    image: hashicorp/vault:1.15.6
+    container_name: hpe-vault
+    ports:
+      - "8200:8200"
+      - "8201:8201"
+    environment:
+      - VAULT_ADDR=http://0.0.0.0:8200
+      - VAULT_API_ADDR=http://vault:8200
+      - VAULT_CLUSTER_ADDR=http://vault:8201
+      - SKIP_CHOWN=true
+      - SKIP_SETCAP=true
+    entrypoint: vault
+    command: server -config=/vault/config/vault.hcl
+    volumes:
+      - ./vault/config:/vault/config
+      - vault_data:/vault/data
+    healthcheck:
+      test: [ "CMD-SHELL", "vault status -address=http://127.0.0.1:8200 2>&1 | grep -E 'Initialized|Sealed'" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - hpe-network
+
+  # ── Vault Init (runs once after vault + postgres are healthy, then exits) ──
+  vault-init:
+    image: hashicorp/vault:1.15.6
+    container_name: hpe-vault-init
+    environment:
+      - VAULT_ADDR=http://vault:8200
+    entrypoint: sh
+    command: /vault/init/init-vault.sh
+    volumes:
+      - ./vault/init:/vault/init
+      - vault_data:/vault/data
+    depends_on:
+      vault:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - hpe-network
+    restart: "no"
+
   # ── FastAPI Backend ──
+  # Phase 3: VAULT_TOKEN removed. Backend authenticates via AppRole using
+  # VAULT_ROLE_ID + VAULT_SECRET_ID read from the shared vault_data volume.
   backend:
     build:
       context: .
@@ -98,13 +147,17 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - VAULT_ADDR=http://vault:8200
-      - VAULT_TOKEN=hpe-dev-token
+      - POSTGRES_URL=postgresql://localhost:5432/hpedb
       - MODEL_PATH=/app/model_output/pipeline_artifacts_v2.joblib
       - TEST_EVENTS_PATH=/app/model_output/test_events.json
       - PROFILES_PATH=/app/model_output/user_profiles.json
+      # VAULT_TOKEN is intentionally removed in Phase 3.
+      # The backend reads role_id + secret_id from /vault/data/.approle_credentials
+      # and exchanges them for a short-lived token via AppRole auth.
     volumes:
       - ./model_output:/app/model_output:ro
       - ./dataset:/app/dataset:ro
+      - vault_data:/vault/data:ro
     depends_on:
       kafka:
         condition: service_healthy
@@ -112,6 +165,10 @@ services:
         condition: service_healthy
       vault:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vault-init:
+        condition: service_completed_successfully
     networks:
       - hpe-network
 
@@ -132,6 +189,8 @@ volumes:
   kafka_data:
   es_data:
   kibana_data:
+  vault_data:
+  postgres_data:
 
 
 networks:

@@ -8,7 +8,23 @@ import os
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9094")
 ELASTICSEARCH_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 VAULT_ADDR = os.getenv("VAULT_ADDR", "http://localhost:8200")
-VAULT_TOKEN = os.getenv("VAULT_TOKEN", "hpe-dev-token")
+
+# ── Phase 3: AppRole auth — VAULT_TOKEN is gone ────────────────────────────────
+# The backend no longer uses a long-lived root token.
+# It reads role_id + secret_id from the shared vault_data volume at startup
+# and exchanges them for a short-lived token (TTL=1h, auto-renewed).
+# VAULT_TOKEN kept as fallback for local dev without Docker.
+VAULT_TOKEN = os.getenv("VAULT_TOKEN", "")
+
+# Path to the approle credentials file written by vault-init
+# Mounted as vault_data:/vault/data:ro in docker-compose.yml
+VAULT_APPROLE_CREDS_FILE = os.getenv(
+    "VAULT_APPROLE_CREDS_FILE",
+    "/vault/data/.approle_credentials"
+)
+
+# ── PostgreSQL (Phase 2 — Vault database secrets engine) ──────────────────────
+POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://localhost:5432/hpedb")
 
 # ── Model paths ────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,15 +45,16 @@ KAFKA_AUDIT_TOPIC = "hpe-audit"
 ES_AUDIT_INDEX = "hpe-audit-logs"
 ES_THREATS_INDEX = "hpe-threats"
 
-# ── Vault secrets path ─────────────────────────────────────────────────────────
+# ── Vault paths ────────────────────────────────────────────────────────────────
 VAULT_SECRETS_PATH = "secret/data/hpe/credentials"
+VAULT_DB_BACKEND_ROLE = "hpe-backend-role"    # read/write, TTL=1h
+VAULT_DB_READONLY_ROLE = "hpe-readonly-role"  # read only,  TTL=30m
 
 # ── Threat thresholds ──────────────────────────────────────────────────────────
 THREAT_LEVELS = {
-    "ALLOW": 0.3,       # Below this → allow
-    "MONITOR": 0.6,     # Between ALLOW and MONITOR → monitor
-    "BLOCK": 0.85,      # Between MONITOR and BLOCK → block
-    # Above BLOCK → CRITICAL_ALERT
+    "ALLOW":   0.3,
+    "MONITOR": 0.6,
+    "BLOCK":   0.85,
 }
 
 # ── Server info ────────────────────────────────────────────────────────────────
