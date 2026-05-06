@@ -224,6 +224,36 @@ kubectl port-forward service/backend 8000:8000 -n hpe
 kubectl delete namespace hpe
 ```
 
+#### Vault Unsealing After Restart
+
+> **Why does Vault seal itself?**
+> Vault uses [Shamir's Secret Sharing](https://en.wikipedia.org/wiki/Shamir%27s_secret_sharing) as a security mechanism. Every time Vault's container restarts (e.g., after `minikube stop` → `minikube start`), Vault deliberately seals itself. This is **by design** — if someone gains physical access to the server, they cannot read any secrets without the unseal key. This is not automated intentionally to preserve the security model.
+
+If the dashboard shows **Vault** as red (🔴) after a Minikube restart, follow these steps:
+
+**Step 1 — Check if Vault is sealed:**
+```bash
+kubectl exec vault-0 -n hpe -- vault status
+```
+If `Sealed: true`, proceed to Step 2.
+
+**Step 2 — Retrieve the unseal key from the PVC:**
+```bash
+kubectl exec vault-0 -n hpe -- cat /vault/data/.unseal_key
+```
+
+**Step 3 — Unseal Vault using the key:**
+```bash
+kubectl exec vault-0 -n hpe -- vault operator unseal <YOUR_UNSEAL_KEY>
+```
+
+**Step 4 — Restart the backend so it reconnects to Vault:**
+```bash
+kubectl rollout restart deployment/backend -n hpe
+```
+
+After this, refresh the dashboard — the Vault indicator should turn green (🟢).
+
 ---
 
 ### Option 3: Local Demo Mode (No Docker) 💻
