@@ -212,7 +212,7 @@ def main():
 
     rf_model = RandomForestClassifier(
         n_estimators=300, max_depth=10, min_samples_leaf=5,
-        class_weight='balanced', random_state=42, n_jobs=-1
+        class_weight='balanced', random_state=42, n_jobs=1
     )
     rf_model.fit(X_train_res, y_train_res)
 
