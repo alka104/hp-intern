@@ -1,4 +1,4 @@
-version: '3.8'
+#version: '3.8'
 
 services:
   # ── Apache Kafka (KRaft mode — Official Apache Image) ──
@@ -147,7 +147,7 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - VAULT_ADDR=http://vault:8200
-      - POSTGRES_URL=postgresql://localhost:5432/hpedb
+      - POSTGRES_URL=postgresql://vault-root:vault-root-secret@postgres:5432/hpedb
       - MODEL_PATH=/app/model_output/pipeline_artifacts_v2.joblib
       - TEST_EVENTS_PATH=/app/model_output/test_events.json
       - PROFILES_PATH=/app/model_output/user_profiles.json
@@ -191,7 +191,6 @@ volumes:
   kibana_data:
   vault_data:
   postgres_data:
-
 
 networks:
   hpe-network:

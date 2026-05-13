@@ -1,49 +1,94 @@
-# deploy.ps1 - One-shot Minikube deployment for HPE Pipeline
-# Preserves all 5 phases: Vault server mode, AppRole, database engine, dual rotation, Kafka creds
-
+# deploy.ps1 - Robust HPE Pipeline deployment
 param(
     [switch]$SkipBuild,
     [switch]$DeleteFirst,
     [switch]$Fresh
 )
 
-Write-Host ""
-Write-Host "=== HPE Threat Detection Pipeline - Minikube Deployment ===" -ForegroundColor Cyan
-Write-Host "  2 Kafka brokers, 2 Backends, 2 Frontends" -ForegroundColor DarkCyan
-Write-Host "  Vault Server Mode + AppRole + Database Engine" -ForegroundColor DarkCyan
-Write-Host ""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-if ($DeleteFirst) {
-    Write-Host "[0/6] Cleaning up previous deployment..." -ForegroundColor Red
-    kubectl delete namespace hpe --ignore-not-found=true 2>$null
-    Start-Sleep -Seconds 5
+function Write-Step($n, $msg) {
+    Write-Host ""
+    Write-Host "[$n] $msg" -ForegroundColor Cyan
 }
 
-# Point Docker to Minikube
-Write-Host "[1/6] Configuring Docker to use Minikube daemon..." -ForegroundColor Yellow
-minikube docker-env | Invoke-Expression
+function Assert-Command($cmd) {
+    if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+        Write-Host "ERROR: '$cmd' not found. Please install it." -ForegroundColor Red
+        exit 1
+    }
+}
 
-if (-not $SkipBuild) {
-    Write-Host ""
-    Write-Host "[2/6] Building Docker images inside Minikube..." -ForegroundColor Yellow
-    docker build -t hpe-backend:latest -f backend/Dockerfile .
-    docker build -t hpe-frontend:latest -f frontend/Dockerfile ./frontend
+function Wait-ForPods($label, $timeout = "240s") {
+    Write-Host "    Waiting for: $label" -ForegroundColor DarkYellow
+    kubectl wait --for=condition=Ready pod -l $label -n hpe --timeout=$timeout
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Pods not ready ($label). Current pod status:" -ForegroundColor Red
+        kubectl get pods -n hpe
+        exit 1
+    }
+    Write-Host "    Ready: $label" -ForegroundColor Green
+}
+
+# ── Pre-flight ──────────────────────────────────────────────────────────────
+Assert-Command "minikube"
+Assert-Command "kubectl"
+Assert-Command "docker"
+
+Write-Host ""
+Write-Host "=== HPE Threat Detection Pipeline ===" -ForegroundColor Cyan
+
+# Make sure MINIKUBE_HOME points to D drive
+# NEW - respects each person's own setup
+if ($env:MINIKUBE_HOME) {
+    Write-Host "  Using MINIKUBE_HOME: $env:MINIKUBE_HOME" -ForegroundColor DarkYellow
 } else {
-    Write-Host ""
-    Write-Host "[2/6] Skipping image build" -ForegroundColor DarkYellow
+    Write-Host "  MINIKUBE_HOME not set - using default Minikube location" -ForegroundColor DarkYellow
+    Write-Host "  (If Minikube fails, set MINIKUBE_HOME to your preferred path)" -ForegroundColor DarkYellow
 }
 
-# Apply namespace + shared resources
-Write-Host ""
-Write-Host "[3/6] Creating namespace and config..." -ForegroundColor Yellow
+# Start minikube if not running
+$mkStatus = (minikube status --format='{{.Host}}' 2>$null)
+if ($mkStatus -ne "Running") {
+    Write-Host "  Starting Minikube..." -ForegroundColor Yellow
+    minikube start --driver=docker --memory=8192 --cpus=4
+}
+
+# ── Phase 0: Optional clean slate ──────────────────────────────────────────
+if ($DeleteFirst) {
+    Write-Step "0" "Removing previous deployment"
+    kubectl delete namespace hpe --ignore-not-found=true
+    Write-Host "  Waiting for namespace to terminate..." -ForegroundColor DarkYellow
+    Start-Sleep -Seconds 10
+}
+
+# ── Phase 1: Docker ─────────────────────────────────────────────────────────
+Write-Step "1" "Pointing Docker at Minikube"
+& minikube docker-env | Invoke-Expression
+
+# ── Phase 2: Build images ───────────────────────────────────────────────────
+if (-not $SkipBuild) {
+    Write-Step "2" "Building backend image"
+    docker build -t hpe-backend:latest -f backend/Dockerfile .
+    if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: backend build failed" -ForegroundColor Red; exit 1 }
+
+    Write-Step "2b" "Building frontend image"
+    docker build -t hpe-frontend:latest -f frontend/Dockerfile ./frontend
+    if ($LASTEXITCODE -ne 0) { Write-Host "ERROR: frontend build failed" -ForegroundColor Red; exit 1 }
+} else {
+    Write-Step "2" "Skipping image builds (--SkipBuild)"
+}
+
+# ── Phase 3: Namespace + config ─────────────────────────────────────────────
+Write-Step "3" "Creating namespace and shared config"
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/secrets.yaml
 kubectl apply -f k8s/vault-pvc.yaml
 
-# Deploy infrastructure
-Write-Host ""
-Write-Host "[4/6] Deploying infrastructure..." -ForegroundColor Yellow
+# ── Phase 4: Infrastructure ─────────────────────────────────────────────────
+Write-Step "4" "Deploying infrastructure services"
 kubectl apply -f k8s/postgres/
 kubectl apply -f k8s/kafka/
 kubectl apply -f k8s/elasticsearch/
@@ -51,58 +96,71 @@ kubectl apply -f k8s/vault/vault-config-configmap.yaml
 kubectl apply -f k8s/vault/vault-service.yaml
 kubectl apply -f k8s/vault/vault-statefulset.yaml
 
-# Wait for infra
-Write-Host ""
-Write-Host "Waiting for infrastructure pods..." -ForegroundColor DarkYellow
-kubectl wait --for=condition=Ready pod -l app=kafka -n hpe --timeout=240s
-kubectl wait --for=condition=Ready pod -l app=elasticsearch -n hpe --timeout=180s
-kubectl wait --for=condition=Ready pod -l app=vault -n hpe --timeout=120s
-kubectl wait --for=condition=Ready pod -l app=postgres -n hpe --timeout=120s
+Write-Host "  Giving pods 20s to start scheduling..." -ForegroundColor DarkYellow
+Start-Sleep -Seconds 20
 
-# Run vault-init Job
-Write-Host ""
-Write-Host "[5/6] Running Vault initialization..." -ForegroundColor Yellow
+Wait-ForPods "app=postgres"    "120s"
+Wait-ForPods "app=kafka"       "240s"
+Wait-ForPods "app=elasticsearch" "180s"
+Wait-ForPods "app=vault"       "120s"
+
+# ── Phase 5: Vault init ─────────────────────────────────────────────────────
+Write-Step "5" "Running Vault initialization"
+kubectl delete job vault-init -n hpe --ignore-not-found=true
+Start-Sleep -Seconds 3
 kubectl apply -f k8s/vault/vault-init-configmap.yaml
 kubectl apply -f k8s/vault/vault-init-job.yaml
+
+Write-Host "  Waiting for vault-init to complete (up to 3 min)..." -ForegroundColor DarkYellow
 kubectl wait --for=condition=Complete job/vault-init -n hpe --timeout=180s
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: vault-init failed! Last 30 log lines:" -ForegroundColor Red
+    kubectl logs job/vault-init -n hpe --tail=30
+    exit 1
+}
+Write-Host "  vault-init complete. Last 5 lines:" -ForegroundColor Green
+kubectl logs job/vault-init -n hpe --tail=5
 
-Write-Host "Vault init logs:" -ForegroundColor DarkYellow
-kubectl logs job/vault-init -n hpe --tail=10
-
-# Deploy application
-Write-Host ""
-Write-Host "[6/6] Deploying backend and frontend..." -ForegroundColor Yellow
+# ── Phase 6: App ────────────────────────────────────────────────────────────
+Write-Step "6" "Deploying backend and frontend"
 kubectl apply -f k8s/backend/
 kubectl apply -f k8s/frontend/
 
-# Wait for app pods
-Write-Host ""
-Write-Host "Waiting for application pods..." -ForegroundColor DarkYellow
-kubectl wait --for=condition=Ready pod -l app=backend -n hpe --timeout=120s
-kubectl wait --for=condition=Ready pod -l app=frontend -n hpe --timeout=120s
+Start-Sleep -Seconds 10
+Wait-ForPods "app=backend"  "120s"
+Wait-ForPods "app=frontend" "120s"
 
+# ── Phase 7: HPA ────────────────────────────────────────────────────────────
+Write-Step "7" "Enabling metrics-server and HPA"
+minikube addons enable metrics-server
+kubectl apply -f k8s/backend/backend-hpa.yaml
+Write-Host "  HPA applied. Takes ~60s for metrics to populate." -ForegroundColor DarkYellow
+
+# ── Optional fresh reset ────────────────────────────────────────────────────
 if ($Fresh) {
-    Write-Host ""
-    Write-Host "[FRESH] Wiping all pipeline data..." -ForegroundColor Magenta
-    # Port-forward backend and call reset API
-    Start-Job -Name "PortForward" -ScriptBlock { kubectl port-forward service/backend 8000:8000 -n hpe } | Out-Null
-    Start-Sleep -Seconds 3
+    Write-Step "FRESH" "Wiping pipeline data via API"
+    $job = Start-Job -ScriptBlock { kubectl port-forward service/backend 8000:8000 -n hpe }
+    Start-Sleep -Seconds 4
     try {
         Invoke-RestMethod -Uri "http://localhost:8000/api/admin/reset" -Method Post
-        Write-Host "[FRESH] Pipeline data wiped - starting clean" -ForegroundColor Green
+        Write-Host "  Pipeline data cleared." -ForegroundColor Green
     } catch {
-        Write-Host "[FRESH] Failed to reset pipeline data: $_" -ForegroundColor Red
+        Write-Host "  Could not reset (backend may still be warming up): $_" -ForegroundColor Yellow
     } finally {
-        Stop-Job -Name "PortForward" | Remove-Job
+        $job | Stop-Job | Remove-Job
     }
 }
 
-# Summary
+# ── Summary ─────────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "=== Deployment Complete ===" -ForegroundColor Green
 Write-Host ""
 kubectl get pods -n hpe
 Write-Host ""
-Write-Host "Access the dashboard:" -ForegroundColor Cyan
-Write-Host "  minikube service frontend -n hpe" -ForegroundColor White
+Write-Host "Next commands:" -ForegroundColor Cyan
+Write-Host "  Open app:          minikube service frontend -n hpe"
+Write-Host "  Watch pods:        kubectl get pods -n hpe -w"
+Write-Host "  Check autoscaler:  kubectl get hpa -n hpe"
+Write-Host "  Manual scale:      kubectl scale deployment backend --replicas=5 -n hpe"
+Write-Host "  Pod logs:          kubectl logs -l app=backend -n hpe --tail=30"
 Write-Host ""
