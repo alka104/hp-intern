@@ -1,0 +1,16 @@
+# ============================================================================
+# DVC Configuration — HPE Threat Detection
+# ============================================================================
+# Configure DVC remote storage for dataset and model versioning.
+# 
+# To set up a remote (examples):
+#   dvc remote add -d myremote s3://my-bucket/hpe-data
+#   dvc remote add -d myremote gdrive://folder-id
+#   dvc remote add -d myremote /path/to/local/storage
+#
+# Then push:
+#   dvc push
+# ============================================================================
+
+[core]
+    autostage = true

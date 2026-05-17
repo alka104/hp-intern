@@ -1,0 +1,28 @@
+# ============================================================================
+# DVC Pipeline Definition — HPE Threat Detection
+# ============================================================================
+# Defines the reproducible ML pipeline stages:
+#   1. train — Feature engineering + model training with MLflow tracking
+#
+# Usage:
+#   dvc repro          # Run the full pipeline
+#   dvc dag             # Visualize the pipeline DAG
+#   dvc metrics show    # Show latest metrics
+# ============================================================================
+
+stages:
+  train:
+    cmd: python export_v2_model.py
+    deps:
+      - export_v2_model.py
+      - dataset/updated_realistic_network_logs.csv
+      - dataset/updated_realistic_user_profiles.csv
+    outs:
+      - model_output/pipeline_artifacts_v2.joblib:
+          persist: true
+    metrics:
+      - model_output/classification_report.txt:
+          cache: false
+    plots:
+      - model_output/classification_report.txt:
+          cache: false
